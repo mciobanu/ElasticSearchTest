@@ -5,4 +5,6 @@ LICENSE	f	2019-06-17T20:32:29Z
 pom.xml	f	2019-06-17T20:37:12Z
 results/PerformanceTests02.csv	f	2019-06-17T20:07:33Z
 results/PerformanceTests02.xlsx	f	2019-06-17T20:12:31Z
-src/main/java/tech/ciobi/TestElasticSearchPerformance.java	f	2019-06-17T20:26:51Z
+results/PerformanceTests05.tsv	f	2019-06-23T06:18:05Z
+results/PerformanceTests05.xlsx	f	2019-06-23T06:13:37Z
+src/main/java/tech/ciobi/TestElasticSearchPerformance.java	f	2019-06-23T06:16:27Z

@@ -21,16 +21,25 @@ import org.elasticsearch.search.sort.FieldSortBuilder;
 import org.elasticsearch.search.sort.SortOrder;
 import org.elasticsearch.transport.client.PreBuiltTransportClient;
 
+import java.io.IOException;
 import java.io.PrintStream;
 import java.net.InetAddress;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * <p/>
@@ -58,9 +67,11 @@ public class TestElasticSearchPerformance {
     private final long documentCount;
     private final int maxThreads; // maxThreads Some data sets fail with too many threads, so we don't run all the thread tests for them
     private final int threadCountForTermImpact;
-    private final int queryCountPerThread;
     private final double base;
+    private final long searchInThreadDuration;
     private final String indexName;
+
+    private AtomicLong searchInThreadEnd = new AtomicLong();
 
     private double truePercent; // percentage of boolean fields that are true; estimated at warm-up, so it can be used on indexes that are generated differently
     private long diskSpace;
@@ -73,16 +84,35 @@ public class TestElasticSearchPerformance {
     private final AtomicInteger queriesWithResultsCount = new AtomicInteger();
     private final AtomicLong totalResultsLowerBound = new AtomicLong();
     private final AtomicLong totalQueryDuration = new AtomicLong();
+    private final AtomicInteger errorCount = new AtomicInteger();
 
     private List<RunResult> runResults = new ArrayList<>();
 
     // some tests are run for various thread counts, which are taken from this list and capped by maxThreads
     private static final int[] THREAD_COUNTS = new int[]{1, 10, 20, 100, 500, 1000, 1500, 2000, 5000};
 
-    // some tests are run for various term counts, which are taken from this list
+    // some tests are run for various term counts, which are taken from this list and capped by boolFieldsCount
     private static final int[] TERM_COUNTS = new int[]{1, 2, 3, 4, 6, 10, 15};
 
-    private TestElasticSearchPerformance(RestHighLevelClient client, int maxRank, int batchSize, int boolFieldsCount, int documentCount, int maxThreads, int threadCountForTermImpact, int queryCountPerThread, double base, String indexName) {
+    private enum QueryType {
+        ALL,  // all attributes must be found
+        SOME, // at least 1 attribute must be found
+        NEGATE_ALL,  // take boolFieldsCount-termCount attributes (so there are many); returns docs where they are false
+        NEGATE_ALL2; // take boolFieldsCount-termCount attributes (so there are many); returns docs where they are not true (so it's the same
+        // results as NEGATE_ALL, but different timing - many times one is significantly faster than the other, but not immediately obvious which beforehand)
+
+        boolean isNegate() {
+            return this == NEGATE_ALL || this == NEGATE_ALL2;
+        }
+    }
+
+
+    private TestElasticSearchPerformance(RestHighLevelClient client, int maxRank, int batchSize, int boolFieldsCount, int documentCount, int maxThreads,
+                                         int threadCountForTermImpact, double base, long searchInThreadDuration, String indexName) {
+
+        if (threadCountForTermImpact > maxThreads) {
+            throw new RuntimeException("threadCountForTermImpact cannot exceed maxThreads");
+        }
 
         this.client = client;
         this.maxRank = maxRank;
@@ -91,8 +121,8 @@ public class TestElasticSearchPerformance {
         this.documentCount = documentCount;
         this.maxThreads = maxThreads;
         this.threadCountForTermImpact = threadCountForTermImpact;
-        this.queryCountPerThread = queryCountPerThread;
         this.base = base;
+        this.searchInThreadDuration = searchInThreadDuration;
         this.indexName = indexName;
 
         double firstTargetCount = documentCount * 0.9;
@@ -111,40 +141,64 @@ public class TestElasticSearchPerformance {
             double pow = Math.pow(base, -i);
             limits[i] = a * pow + b;
         }
-        System.out.println(Arrays.toString(limits));
+        log("%s", Arrays.toString(limits));
+    }
+
+    private static final long[] TIME_BUCKETS = new long[] { 1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5000, 10_000, 20_000 };
+    private AtomicLong[] timeDistribution = new AtomicLong[TIME_BUCKETS.length];
+    {
+        for (int i = 0; i < timeDistribution.length; i++) {
+            timeDistribution[i] = new AtomicLong();
+        }
     }
 
     private class RunResult {
         long duration;
-        int queriesRun;
-        int queriesWithResults;
+        long queriesRun;
+        long queriesWithResults;
         long totalResultsLowerBound; // note that this is capped at 10000 for a query
         int threadCount;
         long totalQueryDuration;
         int minTerms;
         int maxTerms;
+        int errorCount;
+        QueryType queryType;
+        long[] timeDistribution;
 
         void print(PrintStream printStream) {
-            printStream.printf("%s\t%s\t%d\t%,d\t%.3f\t%.3f\t%,d\t" +
-                            "%d\t%d\t%d\t%d\t%d\t%,d\t%,d\t%,d\t" +
+            String distribs = IntStream.range(0, timeDistribution.length)
+                    .boxed()
+                    .map(k -> queryCountToPercent(timeDistribution[k]))
+                    .collect(Collectors.joining("\t"));
+            printStream.printf("%s\t%s\t%d\t%,d\t%.3f\t%.3f\t%,d\t" + // ttt0 probably switch all to %s, as these don't improve readability too much, while truncating results
+                            "%s\t%d\t%d\t%d\t%d\t%,d\t%,d\t%,d\t%,d\t" +
                             "%.3f\t" +
                             "%.3f\t" +
                             "%.3f\t" +
-                            "%,d\t" +
+                            "%,.0f\t" +
+                            "%s\t%s\t" +
                             "%n",
                     RUN_NUMBER++,
                     indexName, boolFieldsCount, documentCount, base, truePercent, diskSpace,
-                    threadCount, queryCountPerThread, minTerms, maxTerms, duration, queriesRun, queriesWithResults, totalResultsLowerBound,
+                    queryType, threadCount, minTerms, maxTerms, duration, queriesRun, queriesWithResults, totalResultsLowerBound, errorCount,
                     queriesRun * 1000.0 / duration, // queries per second
                     queriesWithResults * 100.0 / queriesRun, // percentage of queries that had results
                     totalResultsLowerBound * 1.0 / queriesRun, // average results per query
-                    totalQueryDuration / queriesRun // average query duration
+                    totalQueryDuration * 1.0 / queriesRun, // average query duration
+                    distribs, queryCountToPercent(queriesRun - Arrays.stream(timeDistribution).sum())
             );
+        }
+
+        private String queryCountToPercent(long queryCount) {
+            if (queryCount == 0) {
+                return "";
+            }
+            return String.valueOf(queryCount * 100.0 / queriesRun);
         }
     }
 
     private void testPerformance() {
-        System.out.printf("starting testPerformance for %s%n", indexName);
+        log("starting testPerformance for %s", indexName);
         if (!checkExists()) {
             generate();
         }
@@ -172,32 +226,34 @@ public class TestElasticSearchPerformance {
     }
 
     private void generate() {
-        System.out.printf("starting generate for %s%n", indexName);
+        log("starting generate for %s", indexName);
         for (long start = 0; start < documentCount; start += batchSize) {
             addBulk(start, Math.min(batchSize, documentCount - start));
         }
     }
 
     private void addBulk(long start, long count) {
-        System.out.printf("Adding %d documents to %s%n", count, indexName);
+        log("Adding %d documents to %s", count, indexName);
         try {
             BulkRequest bulkRequest = new BulkRequest(indexName);
             Map<String, Object> m = new TreeMap<>();
             Random random = new Random();
 
             for (int i = 0; i < count; i++) {
-                m.clear();
-                m.put(RANK_FIELD, 1_000_000_000 + random.nextInt(maxRank));
-                for (int j = 0; j < boolFieldsCount; j++) {
-                    m.put(String.format(BOOL_FIELD_FMT, j), random.nextDouble() < limits[j]);
-                }
+                do {
+                    m.clear();
+                    m.put(RANK_FIELD, 1_000_000_000 + random.nextInt(maxRank));
+                    for (int j = 0; j < boolFieldsCount; j++) {
+                        m.put(String.format(BOOL_FIELD_FMT, j), random.nextDouble() < limits[j]);
+                    }
+                } while (!m.values().contains(true));
                 IndexRequest indexRequest = new IndexRequest()
                         .id("" + (i + start))
                         .source(m);
                 bulkRequest.add(indexRequest);
             }
             BulkResponse res = client.bulk(bulkRequest, RequestOptions.DEFAULT);
-            System.out.println(res);
+            log("%s", res);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -205,11 +261,11 @@ public class TestElasticSearchPerformance {
 
 
     private void warmUp() {
-        System.out.printf("Warming up %s%n", indexName);
+        log("Warming up %s", indexName);
         measureDensity();
         retrieveDiskSpace();
         for (int i = 0; i < WARMUP_ITERATION_COUNT; i++) {
-            runQueriesOnMultipleThreads(maxThreads, 1, 5);
+            runQueriesOnMultipleThreads(maxThreads, 1, 5, QueryType.ALL);
         }
     }
 
@@ -218,27 +274,29 @@ public class TestElasticSearchPerformance {
      * Tests the impact on thread count for a small number of terms (between 1 and 5, randomly chosen)
      */
     private void testThreadImpact() {
-        System.out.printf("starting testThreadImpact for %s%n", indexName);
+        log("starting testThreadImpact for %s", indexName);
         for (int k : THREAD_COUNTS) {
             if (k > maxThreads) {
                 break;
             }
-            runResults.add(runQueriesOnMultipleThreads(k, 1, 5));
+            runResults.addAll(runQueriesOnMultipleThreads(k, 1, 5));
         }
     }
 
     private void testTermImpact() {
-        System.out.printf("starting testTermImpact for %s%n", indexName);
+        log("starting testTermImpact for %s", indexName);
         for (int k : TERM_COUNTS) {
-            runResults.add(runQueriesOnMultipleThreads(threadCountForTermImpact, k, k));
+            if (k > boolFieldsCount) {
+                break;
+            }
+            runResults.addAll(runQueriesOnMultipleThreads(threadCountForTermImpact, k, k));
         }
     }
 
 
-
     private void measureDensity() {
         try {
-            System.out.printf("starting measureDensity for %s%n", indexName);
+            log("starting measureDensity for %s", indexName);
             SearchRequest searchRequest = new SearchRequest(indexName);
             SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
             searchSourceBuilder.query(QueryBuilders.matchAllQuery());
@@ -256,10 +314,7 @@ public class TestElasticSearchPerformance {
                     }
                 }
             }
-
-            //System.out.printf("Percentage of true values: %.2f%n", trueCount * 100.0 / readCount / recordSize);
             truePercent = trueCount * 100.0 / readCount / boolFieldsCount;
-            //diskSpace
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -268,9 +323,6 @@ public class TestElasticSearchPerformance {
     private void retrieveDiskSpace() {
         try {
             // The high level REST API doesn't seem to offer something, and not sure the way to use the low level API is right.
-            // We basically parse the response to http://localhost:9200/performance06/_stats with the low-level REST API.
-            // So we use the old Java API, which is being deprecated - https://www.elastic.co/guide/en/elasticsearch/client/java-rest/7.1/_motivations_around_a_new_java_client.html
-
             /*
             // Attempt with high-level API - couldn't figure out how to use it
             ClusterHealthRequest request = new ClusterHealthRequest(indexName);
@@ -279,6 +331,7 @@ public class TestElasticSearchPerformance {
             ClusterHealthResponse health = client.cluster().health(request, RequestOptions.DEFAULT);
             //health.*/
 
+            // Here we basically parse the response to http://localhost:9200/performance06/_stats with the low-level REST API.
             /*try (RestClient lowLevelClient = RestClient.builder(
                     new HttpHost(HOST, 9200, "http"),
                     new HttpHost("localhost", 9201, "http")).build()) {
@@ -299,12 +352,12 @@ public class TestElasticSearchPerformance {
                 diskSpace = indexStatsResponse.indices.get(indexName).total.store.sizeInBytes;
             }*/
 
+            // So we use the old Java API, which is being deprecated - https://www.elastic.co/guide/en/elasticsearch/client/java-rest/7.1/_motivations_around_a_new_java_client.html
             try (TransportClient transportClient = new PreBuiltTransportClient(Settings.EMPTY)
                     .addTransportAddress(new TransportAddress(InetAddress.getByName(HOST), JAVA_API_PORT1))
                     .addTransportAddress(new TransportAddress(InetAddress.getByName(HOST), JAVA_API_PORT2))) {
                 IndicesStatsResponse indicesStatsResponse = transportClient.admin().indices().prepareStats(indexName).get();
                 diskSpace = indicesStatsResponse.getIndices().get(indexName).getTotal().store.getSizeInBytes();
-                System.out.println();
             }
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -333,35 +386,54 @@ public class TestElasticSearchPerformance {
     }*/
 
 
-    private RunResult runQueriesOnMultipleThreads(int threadCount, int minTerms, int maxTerms) {
+    private List<RunResult> runQueriesOnMultipleThreads(int threadCount, int minTerms, int maxTerms) {
+        List<RunResult> res = new ArrayList<>();
+        for (QueryType queryType : QueryType.values()) {
+            res.add(runQueriesOnMultipleThreads(threadCount, minTerms, maxTerms, queryType));
+        }
+        return res;
+    }
+
+
+    private final Object sync = new Object();
+
+    private RunResult runQueriesOnMultipleThreads(int threadCount, int minTerms, int maxTerms, QueryType queryType) {
         try {
-            System.out.printf("starting runQueriesOnMultipleThreads for %s, %s, %s, %s%n", indexName, threadCount, minTerms, maxTerms);
+            log("starting runQueriesOnMultipleThreads for %s, %s, %s, %s", indexName, threadCount, minTerms, maxTerms);
             finishedThreadsCount.set(0);
             finishedQueriesCount.set(0);
             queriesWithResultsCount.set(0);
             totalResultsLowerBound.set(0);
             totalQueryDuration.set(0);
+            errorCount.set(0);
+            searchInThreadEnd.set(System.currentTimeMillis() + searchInThreadDuration);
+            for (var atomicLong : timeDistribution) {
+                atomicLong.set(0);
+            }
+
             long start = System.currentTimeMillis();
             for (int i = 0; i < threadCount; i++) {
                 new Thread(() -> {
                     try {
-                        searchInThread(threadCount, queryCountPerThread, minTerms, maxTerms, false);
-                        finishedThreadsCount.incrementAndGet();
-                        synchronized (finishedThreadsCount) {
-                            finishedThreadsCount.notify();
-                        }
+                        searchInThread(threadCount, minTerms, maxTerms, queryType,false);
                     } catch (Exception e) {
-                        throw new RuntimeException(e);
+                        e.printStackTrace();
+                        errorCount.incrementAndGet();
+                    }
+                    finishedThreadsCount.incrementAndGet();
+                    synchronized (sync) {
+                        sync.notify();
                     }
                 }).start();
             }
             for (; ; ) {
-                synchronized (finishedThreadsCount) {
-                    finishedThreadsCount.wait();
+                synchronized (sync) {
+                    sync.wait(1000); // since many threads use the same sync, it is possible that this won't get awaken and would remain locked
+                    // forever without a timeout; at least this seemed to be the observed behavior, and didn't dig deeper; should review notifyAll() vs notify()
                     if (finishedThreadsCount.get() == threadCount) {
                         break;
                     }
-                    System.out.printf("only %s finished out of %s; continue waiting ...%n", finishedThreadsCount.get(), threadCount);
+                    log("only %s finished out of %s; continue waiting ...", finishedThreadsCount.get(), threadCount);
                 }
             }
             RunResult res = new RunResult();
@@ -373,39 +445,71 @@ public class TestElasticSearchPerformance {
             res.threadCount = threadCount;
             res.minTerms = minTerms;
             res.maxTerms = maxTerms;
-            System.out.printf("overall total run: %s ms, query count: %s, queries with results: %s, queries per second: %s%n", res.duration, finishedQueriesCount.get(), queriesWithResultsCount.get(), queryCountPerThread * threadCount * 1000.0 / res.duration);
-
+            res.queryType = queryType;
+            res.errorCount = errorCount.get();
+            res.timeDistribution = new long[TIME_BUCKETS.length];
+            for (int i = 0; i < TIME_BUCKETS.length; i++) {
+                res.timeDistribution[i] = timeDistribution[i].get();
+            }
+            log("overall total run: %s ms, query count: %s, queries with results: %s, queries per second: %s", res.duration, finishedQueriesCount.get(), queriesWithResultsCount.get(), finishedQueriesCount.get() * 1000.0 / res.duration);
             return res;
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
 
-
-    private void searchInThread(int threadCount, int count, int minTerms, int maxTerms, boolean log) {
-        System.out.printf("starting searchInThread for %s, %s, %s, %s, %s%n", indexName, threadCount, count, minTerms, maxTerms);
+    private void searchInThread(int threadCount, int minTerms, int maxTerms, QueryType queryType, boolean log) {
+        log("starting searchInThread for %s, %s, %s, %s", indexName, threadCount, minTerms, maxTerms);
         long start = System.currentTimeMillis();
-        for (int i = 0; i < count; i++) {
-            individualSearch(threadCount, count, minTerms, maxTerms, log);
+        int run = 0;
+        for (; run == 0 || System.currentTimeMillis() < searchInThreadEnd.get(); run++) {
+            individualSearch(run, threadCount, minTerms, maxTerms, queryType, log);
         }
         long duration = System.currentTimeMillis() - start;
-        System.out.printf("total run for %s, %s, %s, %s, %s: %s, queries per second: %s%n", indexName, threadCount, count, minTerms, maxTerms, duration, count * 1000.0 / duration);
+        log("total run for %s, %s, %s, %s: %s; queries per second: %s", indexName, threadCount, minTerms, maxTerms, duration, run * 1000.0 / duration);
     }
 
 
-    private void individualSearch(int threadCount, int count, int minTerms, int maxTerms, boolean log) {
+    private void individualSearch(int run, int threadCount, int minTerms, int maxTerms, QueryType queryType, boolean log) {
         try {
             long start = System.currentTimeMillis();
-            log |= Math.random() < 0.001;
+            log |= Math.random() < 0.0001;
             if (log) {
-                System.out.printf("starting individualSearch for %s, %s, %s, %s, %s%n", indexName, threadCount, count, minTerms, maxTerms);
+                log("starting individualSearch for %s, %s, %s, %s, %s", run, indexName, threadCount, minTerms, maxTerms);
             }
             SearchRequest searchRequest = new SearchRequest(indexName);
             SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
             BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery();
             Random random = new Random();
-            for (int i = 0; i < minTerms + random.nextInt(maxTerms - minTerms + 1); i++) {
-                boolQueryBuilder.must(QueryBuilders.termQuery(String.format(BOOL_FIELD_FMT, random.nextInt(boolFieldsCount)), true));
+            int termCount = minTerms + random.nextInt(maxTerms - minTerms + 1);
+            Set<Integer> s = new HashSet<>();
+            while (s.size() < termCount) {
+                s.add(random.nextInt(boolFieldsCount));
+            }
+            //boolQueryBuilder.must(boolQueryBuilder); ttt0 play some more with expressions
+
+            for (int i = 0; i < boolFieldsCount; i++) {
+                if (s.contains(i) ^ !queryType.isNegate()) {
+                    continue;
+                }
+                switch (queryType) {
+                    case ALL: {
+                        boolQueryBuilder.must(QueryBuilders.termQuery(String.format(BOOL_FIELD_FMT, i), true));
+                        break;
+                    }
+                    case SOME: {
+                        boolQueryBuilder.should(QueryBuilders.termQuery(String.format(BOOL_FIELD_FMT, i), true));
+                        break;
+                    }
+                    case NEGATE_ALL: {
+                        boolQueryBuilder.mustNot(QueryBuilders.termQuery(String.format(BOOL_FIELD_FMT, i), true));
+                        break;
+                    }
+                    case NEGATE_ALL2: {
+                        boolQueryBuilder.must(QueryBuilders.termQuery(String.format(BOOL_FIELD_FMT, i), false));
+                        break;
+                    }
+                }
             }
             searchSourceBuilder.query(boolQueryBuilder);
             searchSourceBuilder.sort(new FieldSortBuilder(RANK_FIELD).order(SortOrder.ASC));
@@ -417,20 +521,26 @@ public class TestElasticSearchPerformance {
             if (log
                 //|| searchResponse.getHits().getHits().length > 0
             ) {
-                System.out.printf("finished individualSearch for %s, %s, %s, %s, %s; query: %s, total hits: %s, took %s ms (measured locally: %s ms)%n",
-                        indexName, threadCount, count, minTerms, maxTerms,
+                log("finished individualSearch for %s, %s, %s, %s; query: %s, total hits: %s, took %s ms (measured locally: %s ms)",
+                        indexName, threadCount, minTerms, maxTerms,
                         boolQueryBuilder.toString(),
                         searchResponse.getHits().getTotalHits().value,
                         searchResponse.getTook().getMillis(),
                         duration);
                 for (var h : searchResponse.getHits().getHits()) {
-                    System.out.println(new TreeMap<>(h.getSourceAsMap()));
+                    log("%s", new TreeMap<>(h.getSourceAsMap()));
                 }
-                //System.out.println(searchResponse);
+                //log("%s", searchResponse);
             }
 
             totalResultsLowerBound.addAndGet(searchResponse.getHits().getTotalHits().value);
             totalQueryDuration.addAndGet(duration);
+            for (int i = 0; i < TIME_BUCKETS.length; i++) {
+                if (duration < TIME_BUCKETS[i]) {
+                    timeDistribution[i].incrementAndGet();
+                    break;
+                }
+            }
 
             if (searchResponse.getHits().getHits().length > 0) {
                 queriesWithResultsCount.incrementAndGet();
@@ -454,6 +564,8 @@ public class TestElasticSearchPerformance {
         JAVA_API_PORT2 = args.length > 4 ? Integer.parseInt(args[1]) : 9301;
 
         List<TestElasticSearchPerformance> tests = new ArrayList<>();
+
+        long start = System.currentTimeMillis();
 
         try (RestHighLevelClient client = new RestHighLevelClient(
                 RestClient.builder(
@@ -480,14 +592,50 @@ public class TestElasticSearchPerformance {
             tests.add(new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000, 2000, 500, 50, 2.00, "performance06"));
 */
 
-            tests.add(new TestElasticSearchPerformance(client, 10_000, 100_000,  20, 10_000_000, 5000, 500, 50, 2.00, "test01"));
-            tests.add(new TestElasticSearchPerformance(client, 10_000,  50_000,  60,  1_000_000, 2000, 500, 50, 1.29, "test02"));
-            tests.add(new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000,  100, 100, 50, 1.05, "test03"));
-            tests.add(new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000, 2000, 500, 50, 1.25, "test04"));
-            tests.add(new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000, 2000, 500, 50, 2.00, "test05"));
+            //TestElasticSearchPerformance test01 = new TestElasticSearchPerformance(client, 10_000, 100_000,  20, 10_000_000, 5000, 500, 2.00, 60000, "test01");
+            //TestElasticSearchPerformance test01 = new TestElasticSearchPerformance(client, 10_000, 100_000,  20, 10_000_000, 100, 100, 2.00, 10000, "test01");
+            TestElasticSearchPerformance test01 = new TestElasticSearchPerformance(client, 10_000, 100_000,  20, 10_000_000, 100, 100, 2.00, 60000, "test01");
+            tests.add(test01);
+
+            //TestElasticSearchPerformance test02 = new TestElasticSearchPerformance(client, 10_000,  50_000,  60,  1_000_000, 2000, 500, 1.29, 60000, "test02");
+            //TestElasticSearchPerformance test02 = new TestElasticSearchPerformance(client, 10_000,  50_000,  60,  1_000_000, 100, 100, 1.29, 10000, "test02");
+            TestElasticSearchPerformance test02 = new TestElasticSearchPerformance(client, 10_000,  50_000,  60,  1_000_000, 100, 100, 1.29, 60000, "test02");
+            tests.add(test02);
+
+            //TestElasticSearchPerformance test03 = new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000,  100, 100, 1.05, 60000, "test03");
+            //TestElasticSearchPerformance test03 = new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000,   20, 20, 1.05, 10000, "test03");
+            TestElasticSearchPerformance test03 = new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000,  20,  20, 1.05, 60000, "test03");
+            tests.add(test03);
+
+            //TestElasticSearchPerformance test04 = new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000, 2000, 500, 1.25, 60000, "test04");
+            //TestElasticSearchPerformance test04 = new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000, 100, 100, 1.25, 10000, "test04");
+            TestElasticSearchPerformance test04 = new TestElasticSearchPerformance(client, 10_000,  50_000, 100, 50_000_000, 100, 100, 1.25, 60000, "test04");
+            tests.add(test04);
+
+            //TestElasticSearchPerformance test05 = new TestElasticSearchPerformance(client, 10_000,  30_000, 100, 50_000_000, 2000, 500, 2.00, 60000, "test05");
+            //TestElasticSearchPerformance test05 = new TestElasticSearchPerformance(client, 10_000,  30_000, 100, 50_000_000, 100, 100, 2.00, 10000, "test05");
+            TestElasticSearchPerformance test05 = new TestElasticSearchPerformance(client, 10_000,  30_000, 100, 50_000_000, 100, 100, 2.00, 60000, "test05");
+            tests.add(test05);
+
+
+
+            //TestElasticSearchPerformance test05 = new TestElasticSearchPerformance(client, 10_000, 30_000, 100, 50_000_000, 2000, 500, 50, 2.00, "test05");
+            //TestElasticSearchPerformance test05 = new TestElasticSearchPerformance(client, 10_000, 30_000, 100, 50_000_000, 100, 100, 50, 2.00, "test05");
+            //tests.add(test05);
+            //new TestElasticSearchPerformance(client, 10_000,  30_000, 100, 50_000_000, 20, 500, 50, 2.00, "test05").individualNegateSearch(10, 6, 10, 10, true);
+
+            TestElasticSearchPerformance test06 = new TestElasticSearchPerformance(client, 10_000, 30_000, 100, 50_000, 200, 200, 2.0, 60000, "test06");
+            tests.add(test06);
+            //test06.individualNegateSearch(10, 6, 10, 10, true);
+
+            //TestElasticSearchPerformance test07 = new TestElasticSearchPerformance(client, 10_000, 30_000, 5    , 100, 10, 10, 2.0, 100, "test07");
+            TestElasticSearchPerformance test07 = new TestElasticSearchPerformance(client, 10_000, 30_000, 5    , 100, 10, 10, 2.0, 60000, "test07");
+            tests.add(test07);
+
+            //test07.individualSearch(1, 1, 2, 2, QueryType.NEGATE_ALL, true);
+            //test07.individualSearch(1, 1, 2, 2, QueryType.NEGATE_ALL2, true);
 
             tests.forEach(TestElasticSearchPerformance::testPerformance);
-
 
 
             //performance02.add(client);
@@ -571,8 +719,26 @@ public class TestElasticSearchPerformance {
         } catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
-            System.out.println("run\tindex name\tbool fields count\tdocument count\tbase\tpercentage of true\tdisk space\tthread count\tquery count per thread\tmin terms\tmax terms\tduration\tqueries run\tqueries with results\ttotal results lower bound\tqueries per second\tpercentage of queries that had results\taverage results per query\taverage query duration");
+            System.out.printf("\n\n=================================================================================\nTotal duration: %s\n=================================================================================%n", System.currentTimeMillis() - start);
+
+            System.out.print("run\tindex name\tbool fields count\tdocument count\tbase\tpercentage of true\tdisk space\tquery type\tthread count\tmin terms\tmax terms\tduration\tqueries run\t" +
+                    "queries with results\ttotal results lower bound\terror count\tqueries per second\tpercentage of queries that had results\taverage results per query\taverage query duration");
+            for (long t : TIME_BUCKETS) {
+                System.out.printf("\t<%,d", t);
+            }
+            System.out.printf("\t>=%,d\n", TIME_BUCKETS[TIME_BUCKETS.length - 1]);
             tests.forEach(TestElasticSearchPerformance::printResults);
+        }
+    }
+
+    //ttt0 switch to Log4j
+    private static void log(String s, Object... params) {
+        String msg = String.format("%s %s\n", new Date(), String.format(s, params));
+        System.out.print(msg);
+        try {
+            Files.write(Paths.get("log.txt"), msg.getBytes(), StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            e.printStackTrace();
         }
     }
 }
